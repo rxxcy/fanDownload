@@ -1,2 +1,3 @@
 # fanDownload
-anime1 番剧下载器
+anime1 下载器-.-
+python3.6.5
