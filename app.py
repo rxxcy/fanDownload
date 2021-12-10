@@ -19,22 +19,22 @@ def main():
     pass
 
 def handleSelectDownload(key, anime):
-    print(f'「\033[35m{key}\033[0m」的搜尋結果')
+    print(f'「{key}」的搜尋結果')
     for index, item in enumerate(anime):
-        print(f'\033[31m{index}\033[0m. {item["title"]}')
+        print(f'{index}. {item["title"]}')
     index = input('输入索引(默认 all)：')
     if index == '' or index == 'all':
-        print('\033[41m下载全部\033[0m')
+        print('下载全部')
         for item in anime:
             handleGetDownloadUrl(item)
-        print('\033[41m全部下载完成\033[0m')
+        print('全部下载完成')
     else:
         index = int(index)
         if index > len(anime) or index < 0:
-            print('\033[41m煞笔\033[0m')
+            print('煞笔')
             return None
         else:
-            print('\033[41m下载单集\033[0m')
+            print('下载单集')
             handleGetDownloadUrl(anime[index])
             return None
     return True
@@ -67,7 +67,7 @@ def handleSearch(key=None):
 def handGetAnimeList(key, soup):
     lists = soup.find(id='content').find_all('article')
     if lists is None:
-        print(f'关于 「\033[35m{key}\033[0m」 未找到任何内容 0x0')
+        print(f'关于 「{key}」 未找到任何内容 0x0')
         exit(0)
     animeList = []
     for item in lists:
@@ -83,7 +83,7 @@ def handGetAnimeList(key, soup):
 
     length = len(animeList)
     if length <= 0:
-        print(f'关于 「\033[35m{key}\033[0m」 未找到任何内容 0x1')
+        print(f'关于 「{key}」 未找到任何内容 0x1')
         exit(0)
     return animeList
 
@@ -98,7 +98,7 @@ def handleGetPlayUrl(item):
     return video
 
 def handleGetDownloadUrl(item):
-    print(f'获取 \033[35m{item["title"]}\033[0m 真实下载地址')
+    print(f'获取 {item["title"]} 真实下载地址')
     video = handleGetPlayUrl(item)
     if not video:
         return video
