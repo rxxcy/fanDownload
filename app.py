@@ -121,6 +121,8 @@ def getDownloadUrl(url, title):
 
 
 def handleDownload(src, title,cookie):
+    if not os.path.exists('video'):
+        os.mkdir('video')
     print('下载中...')
     temp = re.sub(r'\[\d+\]', '', title).strip()
     path = f'video/{temp}'
