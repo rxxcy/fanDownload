@@ -328,9 +328,23 @@ def download_video(src, title, cookie, progress_callback=None, printer=print, st
         printer(f"{title} 下载完成")
 
 
+def split_episode_suffix(title):
+    stripped = title.strip()
+    match = re.search(r"\[(\d+)\]\s*$", stripped)
+    if not match:
+        return stripped, None
+
+    episode = match.group(1)
+    base_title = stripped[:match.start()].rstrip()
+    return base_title, episode
+
+
 def sanitize_title(title):
-    cleaned = re.sub(r"\[\d+\]", "", title).strip()
-    return re.sub(r'[\\/:*?"<>|]', "_", cleaned)
+    base_title, episode = split_episode_suffix(title)
+    cleaned = re.sub(r'[\\/:*?"<>|]', "_", base_title).strip()
+    if episode and cleaned:
+        return f"{cleaned}-{episode}"
+    return cleaned
 
 
 def create_output_path(title):
