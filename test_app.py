@@ -1,4 +1,10 @@
 import unittest
+from pathlib import Path
+import threading
+import time
+import tempfile
+import io
+from contextlib import redirect_stdout
 
 import app
 
@@ -88,10 +94,10 @@ class ParseVideoItemsTests(unittest.TestCase):
         items = app.parse_video_items(DEMO_HTML)
 
         self.assertEqual(12, len(items))
-        self.assertEqual("身為魔族的我 想向勇者小隊的可愛女孩告白 [12]", items[0]["title"])
+        self.assertEqual("身為魔族的我 想向勇者小隊的可愛女孩告白 [01]", items[0]["title"])
         self.assertTrue(items[0]["api_req"])
         self.assertTrue(items[0]["api_req"].startswith("{"))
-        self.assertEqual("身為魔族的我 想向勇者小隊的可愛女孩告白 [01]", items[-1]["title"])
+        self.assertEqual("身為魔族的我 想向勇者小隊的可愛女孩告白 [12]", items[-1]["title"])
 
     def test_parse_video_items_returns_empty_list_when_page_has_no_video_entries(self):
         html = "<html><body><article><h2>no video</h2></article></body></html>"
@@ -119,9 +125,23 @@ class SelectVideoTests(unittest.TestCase):
             {"title": "Episode 3", "api_req": "req-3"},
         ]
 
-        selected = app.select_video(items, input_fn=lambda _: "0 2")
+        selected = app.select_video(items, input_fn=lambda _: "1 3")
 
         self.assertEqual([items[0], items[2]], selected)
+
+    def test_select_video_displays_one_based_indexes(self):
+        items = [
+            {"title": "Episode 1", "api_req": "req-1"},
+            {"title": "Episode 2", "api_req": "req-2"},
+        ]
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            app.select_video(items, input_fn=lambda _: "")
+
+        rendered = output.getvalue()
+        self.assertIn("1. Episode 1", rendered)
+        self.assertIn("2. Episode 2", rendered)
 
 
 class NormalizeUrlTests(unittest.TestCase):
@@ -132,6 +152,201 @@ class NormalizeUrlTests(unittest.TestCase):
 
         self.assertNotIn("年冬季", normalized)
         self.assertTrue(normalized.startswith("https://anime1.me/category/"))
+
+
+class DownloadSelectedItemsTests(unittest.TestCase):
+    def test_download_selected_items_limits_parallelism_to_three_workers(self):
+        items = [
+            {"title": f"Episode {index}", "api_req": f"req-{index}"}
+            for index in range(5)
+        ]
+        active_count = 0
+        max_active_count = 0
+        lock = threading.Lock()
+
+        def downloader(item, progress_callback=None):
+            nonlocal active_count, max_active_count
+            with lock:
+                active_count += 1
+                max_active_count = max(max_active_count, active_count)
+            time.sleep(0.05)
+            with lock:
+                active_count -= 1
+
+        result = app.download_selected_items(
+            items,
+            max_workers=3,
+            downloader=downloader,
+            printer=lambda *_args, **_kwargs: None,
+            progress_enabled=False,
+        )
+
+        self.assertEqual(3, max_active_count)
+        self.assertEqual([item["title"] for item in items], result["successes"])
+        self.assertEqual([], result["failures"])
+
+    def test_download_selected_items_collects_failures_without_stopping_other_tasks(self):
+        items = [
+            {"title": "Episode 1", "api_req": "req-1"},
+            {"title": "Episode 2", "api_req": "req-2"},
+            {"title": "Episode 3", "api_req": "req-3"},
+        ]
+
+        def downloader(item, progress_callback=None):
+            if item["title"] == "Episode 2":
+                raise RuntimeError("network error")
+
+        result = app.download_selected_items(
+            items,
+            max_workers=3,
+            downloader=downloader,
+            printer=lambda *_args, **_kwargs: None,
+            progress_enabled=False,
+        )
+
+        self.assertEqual(["Episode 1", "Episode 3"], result["successes"])
+        self.assertEqual([("Episode 2", "network error")], result["failures"])
+
+    def test_download_selected_items_only_prints_start_for_running_workers(self):
+        items = [
+            {"title": f"Episode {index}", "api_req": f"req-{index}"}
+            for index in range(5)
+        ]
+        started = threading.Event()
+        release = threading.Event()
+        lock = threading.Lock()
+        started_count = 0
+        logs = []
+
+        def printer(*args, **kwargs):
+            with lock:
+                logs.append(" ".join(str(arg) for arg in args))
+
+        def downloader(item, progress_callback=None, printer=None):
+            nonlocal started_count
+            with lock:
+                started_count += 1
+                if started_count == 3:
+                    started.set()
+            release.wait(timeout=1)
+
+        thread = threading.Thread(
+            target=app.download_selected_items,
+            kwargs={
+                "items": items,
+                "max_workers": 3,
+                "downloader": downloader,
+                "printer": printer,
+                "progress_enabled": False,
+            },
+        )
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        time.sleep(0.05)
+        with lock:
+            start_logs = [line for line in logs if line.startswith("开始下载: ")]
+        self.assertEqual(
+            ["开始下载: Episode 0", "开始下载: Episode 1", "开始下载: Episode 2"],
+            start_logs,
+        )
+        release.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+
+class ParallelProgressReporterTests(unittest.TestCase):
+    def test_parallel_progress_reporter_skips_zero_percent_updates(self):
+        logs = []
+        reporter = app.ParallelProgressReporter(printer=logs.append, percent_step=10)
+        callback = reporter.make_callback("Episode 1")
+
+        callback(1024, 100 * 1024 * 1024, 3.91)
+
+        self.assertEqual([], logs)
+
+
+class StopEventTests(unittest.TestCase):
+    def test_download_video_stops_and_removes_partial_file_when_stop_event_is_set(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_open_url = app.open_url
+            original_create_output_path = app.create_output_path
+            stop_event = threading.Event()
+
+            class FakeHeaders(dict):
+                def get(self, key, default=None):
+                    return super().get(key, default)
+
+            class FakeResponse:
+                def __init__(self):
+                    self.headers = FakeHeaders({"Content-Length": str(16 * 1024)})
+                    self._reads = 0
+
+                def read(self, size):
+                    if self._reads == 0:
+                        self._reads += 1
+                        return b"x" * size
+                    stop_event.set()
+                    self._reads += 1
+                    return b"x" * size
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            def fake_open_url(_request):
+                return FakeResponse()
+
+            def fake_create_output_path(_title):
+                output_dir = Path(temp_dir) / "video" / "Episode 1"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                return str(output_dir / "Episode 1.mp4")
+
+            app.open_url = fake_open_url
+            app.create_output_path = fake_create_output_path
+
+            with self.assertRaises(app.DownloadCancelledError):
+                app.download_video(
+                    "https://example.com/video.mp4",
+                    "Episode 1",
+                    "",
+                    stop_event=stop_event,
+                    printer=lambda *_args, **_kwargs: None,
+                )
+
+            self.assertFalse((Path(temp_dir) / "video" / "Episode 1" / "Episode 1.mp4").exists())
+            app.open_url = original_open_url
+            app.create_output_path = original_create_output_path
+
+    def test_download_selected_items_does_not_start_new_tasks_after_stop_event(self):
+        items = [
+            {"title": f"Episode {index}", "api_req": f"req-{index}"}
+            for index in range(5)
+        ]
+        stop_event = threading.Event()
+        started_titles = []
+        lock = threading.Lock()
+
+        def downloader(item, progress_callback=None):
+            with lock:
+                started_titles.append(item["title"])
+                if len(started_titles) == 1:
+                    stop_event.set()
+            time.sleep(0.05)
+
+        result = app.download_selected_items(
+            items,
+            max_workers=3,
+            downloader=downloader,
+            printer=lambda *_args, **_kwargs: None,
+            progress_enabled=False,
+            stop_event=stop_event,
+        )
+
+        self.assertEqual(["Episode 0"], started_titles)
+        self.assertEqual(["Episode 0"], result["successes"])
+        self.assertEqual([], result["failures"])
 
 
 if __name__ == "__main__":

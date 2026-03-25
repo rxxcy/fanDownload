@@ -1,9 +1,12 @@
 # -*- coding:utf-8 -*-
 # anime1 页面视频下载器
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import inspect
 import json
 import os
 import re
+import threading
 import time
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
@@ -17,6 +20,11 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/95.0.4638.69 Safari/537.36"
 )
+DEFAULT_MAX_WORKERS = 3
+
+
+class DownloadCancelledError(Exception):
+    pass
 
 
 class AnimePageParser(HTMLParser):
@@ -100,10 +108,13 @@ def main():
         return
 
     selected_items = select_video(items)
-    for selected in selected_items:
-        print(f"获取 {selected['title']} 真实下载地址")
-        src, cookie = resolve_download_url(selected["api_req"])
-        download_video(src, selected["title"], cookie)
+    stop_event = threading.Event()
+    try:
+        download_selected_items(selected_items, max_workers=DEFAULT_MAX_WORKERS, stop_event=stop_event)
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("\n正在停止下载，请稍候...")
+        print("已取消下载，程序退出")
 
 
 def normalize_url(url):
@@ -124,7 +135,7 @@ def parse_video_items(html):
     parser = AnimePageParser()
     parser.feed(html)
     parser.close()
-    return parser.items
+    return list(reversed(parser.items))
 
 
 def select_video(items, input_fn=input):
@@ -132,8 +143,8 @@ def select_video(items, input_fn=input):
         raise ValueError("未找到可下载视频")
 
     print("页面内可下载的视频：")
-    for index, item in enumerate(items):
-        print(f"{index}. {item['title']}")
+    for display_index, item in enumerate(items, start=1):
+        print(f"{display_index}. {item['title']}")
 
     while True:
         raw = input_fn("\n输入索引（空格分隔，回车默认全部）：").strip()
@@ -146,7 +157,7 @@ def select_video(items, input_fn=input):
             continue
 
         indexes = [int(part) for part in parts]
-        if any(index < 0 or index >= len(items) for index in indexes):
+        if any(index < 1 or index > len(items) for index in indexes):
             print("索引超出范围")
             continue
 
@@ -156,7 +167,7 @@ def select_video(items, input_fn=input):
             if index in seen_indexes:
                 continue
             seen_indexes.add(index)
-            selected_items.append(items[index])
+            selected_items.append(items[index - 1])
         return selected_items
 
 
@@ -172,39 +183,149 @@ def resolve_download_url(api_req):
     return f"https:{src}", cookie
 
 
-def download_video(src, title, cookie):
-    safe_title = sanitize_title(title)
-    file_dir = os.path.join("video", safe_title)
-    os.makedirs(file_dir, exist_ok=True)
-    file_path = os.path.join(file_dir, f"{safe_title}.mp4")
+def download_item(item, progress_callback=None, printer=print):
+    printer(f"获取 {item['title']} 真实下载地址")
+    src, cookie = resolve_download_url(item["api_req"])
+    download_video(src, item["title"], cookie, progress_callback=progress_callback, printer=printer)
+
+
+def download_selected_items(items, max_workers=DEFAULT_MAX_WORKERS, downloader=None, printer=print, progress_enabled=True, stop_event=None):
+    if not items:
+        return {"successes": [], "failures": []}
+
+    if downloader is None:
+        downloader = download_item
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    worker_count = min(max_workers, len(items))
+    progress_reporter = ParallelProgressReporter(printer=printer) if progress_enabled and len(items) > 1 else None
+    completed_titles = set()
+    failed_titles = {}
+
+    if worker_count == 1:
+        item = items[0]
+        try:
+            run_download_task(downloader, item, None, printer, stop_event=stop_event)
+            completed_titles.add(item["title"])
+        except DownloadCancelledError:
+            printer(f"下载已取消: {item['title']}")
+        except Exception as exc:
+            failed_titles[item["title"]] = str(exc)
+            printer(f"下载失败: {item['title']} - {exc}")
+    else:
+        printer(f"并行下载已启动，最大并发数: {worker_count}")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_item = {}
+            for item in items:
+                if stop_event.is_set():
+                    break
+                progress_callback = None
+                if progress_reporter is not None:
+                    progress_callback = progress_reporter.make_callback(item["title"])
+                future = executor.submit(run_download_task, downloader, item, progress_callback, printer, True, stop_event)
+                future_to_item[future] = item
+
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                try:
+                    future.result()
+                    completed_titles.add(item["title"])
+                    printer(f"下载完成: {item['title']}")
+                except DownloadCancelledError:
+                    printer(f"下载已取消: {item['title']}")
+                except Exception as exc:
+                    failed_titles[item["title"]] = str(exc)
+                    printer(f"下载失败: {item['title']} - {exc}")
+
+                if stop_event.is_set():
+                    for pending_future, pending_item in future_to_item.items():
+                        if pending_future.done():
+                            continue
+                        pending_future.cancel()
+                        printer(f"下载已取消: {pending_item['title']}")
+                    break
+
+    successes = [item["title"] for item in items if item["title"] in completed_titles]
+    failures = [(item["title"], failed_titles[item["title"]]) for item in items if item["title"] in failed_titles]
+
+    printer(f"下载汇总: 成功 {len(successes)} 集, 失败 {len(failures)} 集")
+    return {"successes": successes, "failures": failures}
+
+
+def run_download_task(downloader, item, progress_callback, printer, announce_start=False, stop_event=None):
+    if stop_event is not None and stop_event.is_set():
+        raise DownloadCancelledError("download cancelled")
+    if announce_start:
+        printer(f"开始下载: {item['title']}")
+    signature = inspect.signature(downloader)
+    parameters = signature.parameters
+    if "stop_event" in parameters:
+        if "printer" in parameters:
+            return downloader(item, progress_callback=progress_callback, printer=printer, stop_event=stop_event)
+        if "progress_callback" in parameters:
+            return downloader(item, progress_callback=progress_callback, stop_event=stop_event)
+        return downloader(item, stop_event=stop_event)
+    if "printer" in parameters:
+        return downloader(item, progress_callback=progress_callback, printer=printer)
+    if "progress_callback" in parameters:
+        return downloader(item, progress_callback=progress_callback)
+    return downloader(item)
+
+
+def download_video(src, title, cookie, progress_callback=None, printer=print, stop_event=None):
+    file_path = create_output_path(title)
 
     headers = {"Referer": REFERER}
     if cookie:
         headers["Cookie"] = cookie
 
     request = build_request(src, headers=headers)
-    print("下载中...")
-    with open_url(request) as response, open(file_path, "wb") as file_obj:
-        total_length = response.headers.get("Content-Length")
-        if total_length is None:
-            while True:
-                chunk = response.read(4096)
-                if not chunk:
-                    break
-                file_obj.write(chunk)
-        else:
-            total_size = int(total_length)
-            downloaded = 0
-            start = time.time()
-            while True:
-                chunk = response.read(4096)
-                if not chunk:
-                    break
-                file_obj.write(chunk)
-                downloaded += len(chunk)
-                show_progress(downloaded, total_size, start)
-    print()
-    print(f"{title} 下载完成")
+    if progress_callback is None:
+        printer("下载中...")
+    try:
+        with open_url(request) as response, open(file_path, "wb") as file_obj:
+            total_length = response.headers.get("Content-Length")
+            if total_length is None:
+                downloaded = 0
+                start = time.time()
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        raise DownloadCancelledError("download cancelled")
+                    chunk = response.read(4096)
+                    if not chunk:
+                        break
+                    file_obj.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback is not None:
+                        elapsed = max(time.time() - start, 0.001)
+                        speed = downloaded / 1024 / 1024 / elapsed
+                        progress_callback(downloaded, None, speed)
+            else:
+                total_size = int(total_length)
+                downloaded = 0
+                start = time.time()
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        raise DownloadCancelledError("download cancelled")
+                    chunk = response.read(4096)
+                    if not chunk:
+                        break
+                    file_obj.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback is None:
+                        show_progress(downloaded, total_size, start, printer=printer)
+                    else:
+                        elapsed = max(time.time() - start, 0.001)
+                        speed = downloaded / 1024 / 1024 / elapsed
+                        progress_callback(downloaded, total_size, speed)
+    except DownloadCancelledError:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
+    if progress_callback is None:
+        printer()
+        printer(f"{title} 下载完成")
 
 
 def sanitize_title(title):
@@ -212,18 +333,62 @@ def sanitize_title(title):
     return re.sub(r'[\\/:*?"<>|]', "_", cleaned)
 
 
-def show_progress(downloaded, total_size, start_time):
+def create_output_path(title):
+    safe_title = sanitize_title(title)
+    file_dir = os.path.join("video", safe_title)
+    os.makedirs(file_dir, exist_ok=True)
+    return os.path.join(file_dir, f"{safe_title}.mp4")
+
+
+def show_progress(downloaded, total_size, start_time, printer=print):
     done = int(50 * downloaded / total_size)
     percent_done = int(100 * downloaded / total_size)
     downloaded_mb = downloaded / 1024 / 1024
     total_mb = total_size / 1024 / 1024
     elapsed = max(time.time() - start_time, 0.001)
     speed = downloaded_mb / elapsed
-    print(
+    printer(
         f"\r[{'#' * done}{' ' * (50 - done)}] {percent_done}% "
         f"({downloaded_mb:.2f}Mb/{total_mb:.2f}Mb) {speed:.2f}Mb/s",
         end="",
     )
+
+
+class ParallelProgressReporter:
+    def __init__(self, printer=print, percent_step=10):
+        self._printer = printer
+        self._percent_step = percent_step
+        self._lock = threading.Lock()
+        self._progress_state = {}
+
+    def make_callback(self, title):
+        self._progress_state[title] = {"last_bucket": -1, "started": False}
+
+        def callback(downloaded, total_size, speed):
+            with self._lock:
+                state = self._progress_state[title]
+                if total_size is None:
+                    if not state["started"]:
+                        state["started"] = True
+                        self._printer(f"[进度] {title}: 已开始下载")
+                    return
+
+                percent_done = int(100 * downloaded / total_size)
+                percent_bucket = min(100, (percent_done // self._percent_step) * self._percent_step)
+                if percent_bucket == 0 and percent_done < 100:
+                    return
+                if percent_bucket <= state["last_bucket"]:
+                    return
+
+                state["last_bucket"] = percent_bucket
+                downloaded_mb = downloaded / 1024 / 1024
+                total_mb = total_size / 1024 / 1024
+                self._printer(
+                    f"[进度] {title}: {percent_done}% "
+                    f"({downloaded_mb:.2f}Mb/{total_mb:.2f}Mb) {speed:.2f}Mb/s"
+                )
+
+        return callback
 
 
 def join_cookies(cookie_headers):
