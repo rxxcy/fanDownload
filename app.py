@@ -1,170 +1,264 @@
 # -*- coding:utf-8 -*-
-#  anime1 番剧下载器
+# anime1 页面视频下载器
 
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import unquote
-import re
+import json
 import os
+import re
 import time
+from html.parser import HTMLParser
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.request import ProxyHandler, Request, build_opener
+
+
+API_URL = "https://v.anime1.me/api"
+REFERER = "https://v.anime1.me/"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/95.0.4638.69 Safari/537.36"
+)
+
+
+class AnimePageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.items = []
+        self._in_article = False
+        self._article_depth = 0
+        self._in_heading = False
+        self._capture_title = False
+        self._current_title_parts = []
+        self._current_api_req = None
+
+    def handle_starttag(self, tag, attrs):
+        attr_map = dict(attrs)
+        if tag == "article":
+            if not self._in_article:
+                self._start_article()
+            else:
+                self._article_depth += 1
+            return
+
+        if not self._in_article:
+            return
+
+        if tag == "h2":
+            self._in_heading = True
+        elif tag == "a" and self._in_heading and not self._current_title_parts:
+            self._capture_title = True
+        elif tag == "video":
+            api_req = attr_map.get("data-apireq")
+            if api_req:
+                self._current_api_req = unquote(api_req)
+
+    def handle_endtag(self, tag):
+        if not self._in_article:
+            return
+
+        if tag == "article":
+            self._article_depth -= 1
+            if self._article_depth == 0:
+                self._finish_article()
+        elif tag == "h2":
+            self._in_heading = False
+            self._capture_title = False
+        elif tag == "a":
+            self._capture_title = False
+
+    def handle_data(self, data):
+        if self._capture_title:
+            self._current_title_parts.append(data)
+
+    def _start_article(self):
+        self._in_article = True
+        self._article_depth = 1
+        self._in_heading = False
+        self._capture_title = False
+        self._current_title_parts = []
+        self._current_api_req = None
+
+    def _finish_article(self):
+        title = "".join(self._current_title_parts).strip()
+        if title and self._current_api_req:
+            self.items.append({"title": title, "api_req": self._current_api_req})
+        self._in_article = False
+        self._in_heading = False
+        self._capture_title = False
+        self._current_title_parts = []
+        self._current_api_req = None
 
 
 def main():
-    key = input('关键字：')
-    while key == '':
-        key = input('请输入关键字!!!')
-        # key = '鬼滅之刃 刀匠村篇'
-    anime = handleSearch(key)
-    cmd = None
-    while not cmd:
-        cmd = handleSelectDownload(key, anime)
-    pass
+    page_url = input("页面链接：").strip()
+    while not page_url:
+        page_url = input("请输入页面链接：").strip()
+
+    html = fetch_page(page_url)
+    items = parse_video_items(html)
+    if not items:
+        print("页面内未找到可下载视频")
+        return
+
+    selected_items = select_video(items)
+    for selected in selected_items:
+        print(f"获取 {selected['title']} 真实下载地址")
+        src, cookie = resolve_download_url(selected["api_req"])
+        download_video(src, selected["title"], cookie)
 
 
-def handleSelectDownload(key, anime):
-    print(f'「{key}」的搜尋結果')
-    for index, item in enumerate(anime):
-        print(f'{index}. {item["title"]}')
-    index = input('输入索引(默认 all)：')
-    if index == '' or index == 'all':
-        print('下载全部')
-        for item in anime:
-            handleGetDownloadUrl(item)
-        print('全部下载完成')
-    else:
-        index = int(index)
-        if index > len(anime) or index < 0:
-            print('煞笔')
-            return None
+def normalize_url(url):
+    parts = urlsplit(url.strip())
+    path = quote(unquote(parts.path), safe="/")
+    query = urlencode(parse_qsl(parts.query, keep_blank_values=True), doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+
+def fetch_page(url):
+    request = build_request(normalize_url(url))
+    with open_url(request) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+
+def parse_video_items(html):
+    parser = AnimePageParser()
+    parser.feed(html)
+    parser.close()
+    return parser.items
+
+
+def select_video(items, input_fn=input):
+    if not items:
+        raise ValueError("未找到可下载视频")
+
+    print("页面内可下载的视频：")
+    for index, item in enumerate(items):
+        print(f"{index}. {item['title']}")
+
+    while True:
+        raw = input_fn("\n输入索引（空格分隔，回车默认全部）：").strip()
+        if not raw:
+            return items
+
+        parts = raw.split()
+        if any(not part.isdigit() for part in parts):
+            print("请输入有效数字")
+            continue
+
+        indexes = [int(part) for part in parts]
+        if any(index < 0 or index >= len(items) for index in indexes):
+            print("索引超出范围")
+            continue
+
+        selected_items = []
+        seen_indexes = set()
+        for index in indexes:
+            if index in seen_indexes:
+                continue
+            seen_indexes.add(index)
+            selected_items.append(items[index])
+        return selected_items
+
+
+def resolve_download_url(api_req):
+    payload = urlencode({"d": api_req}).encode("utf-8")
+    request = build_request(API_URL, data=payload, headers={"Referer": REFERER})
+    with open_url(request) as response:
+        data = json.loads(response.read().decode("utf-8"))
+        src = data["s"][0]["src"]
+        cookie = join_cookies(response.headers.get_all("Set-Cookie") or [])
+    if src.startswith("http"):
+        return src, cookie
+    return f"https:{src}", cookie
+
+
+def download_video(src, title, cookie):
+    safe_title = sanitize_title(title)
+    file_dir = os.path.join("video", safe_title)
+    os.makedirs(file_dir, exist_ok=True)
+    file_path = os.path.join(file_dir, f"{safe_title}.mp4")
+
+    headers = {"Referer": REFERER}
+    if cookie:
+        headers["Cookie"] = cookie
+
+    request = build_request(src, headers=headers)
+    print("下载中...")
+    with open_url(request) as response, open(file_path, "wb") as file_obj:
+        total_length = response.headers.get("Content-Length")
+        if total_length is None:
+            while True:
+                chunk = response.read(4096)
+                if not chunk:
+                    break
+                file_obj.write(chunk)
         else:
-            print('下载单集')
-            handleGetDownloadUrl(anime[index])
-            return None
-    return True
+            total_size = int(total_length)
+            downloaded = 0
+            start = time.time()
+            while True:
+                chunk = response.read(4096)
+                if not chunk:
+                    break
+                file_obj.write(chunk)
+                downloaded += len(chunk)
+                show_progress(downloaded, total_size, start)
+    print()
+    print(f"{title} 下载完成")
 
 
-def handleSearch(key=None):
-    print('正在搜索...')
-    url = 'https://anime1.me/?s='
-    res = requests.get(url=f"{url}{key}", proxies=proxies)
-    html = res.text
-    soup = BeautifulSoup(html, 'html.parser')
-    anime = []
-    temp = handGetAnimeList(key, soup)
-    page = soup.find(attrs={'class': 'nav-previous'})
-    if page is None:
-        temp = temp[0: -2]
-    anime.extend(temp)
-    while page:
-        href = page.find('a').attrs['href']
-        res = requests.get(url=href, proxies=proxies)
-        html = res.text
-        soup = BeautifulSoup(html, 'html.parser')
-        temp = handGetAnimeList(key, soup)
-        page = soup.find(attrs={'class': 'nav-previous'})
-        if page is None:
-            temp = temp[0: -3]
-            # anime.extend(temp)
-        anime.extend(temp)
-    return anime
+def sanitize_title(title):
+    cleaned = re.sub(r"\[\d+\]", "", title).strip()
+    return re.sub(r'[\\/:*?"<>|]', "_", cleaned)
 
 
-def handGetAnimeList(key, soup):
-    lists = soup.find(id='content').find_all('article')
-    if lists is None:
-        print(f'关于 「{key}」 未找到任何内容 0x0')
-        exit(0)
-    animeList = []
-    for item in lists:
-        header = item.find('header')
-        h2 = header.find('h2')
-        a = h2.find('a')
-        if a.text is not None and a.attrs['href'] is not None:
-            temp = {
-                'title': a.text,
-                'url': a.attrs['href']
-            }
-            animeList.append(temp)
-
-    length = len(animeList)
-    if length <= 0:
-        print(f'关于 「{key}」 未找到任何内容 0x1')
-        exit(0)
-    return animeList
+def show_progress(downloaded, total_size, start_time):
+    done = int(50 * downloaded / total_size)
+    percent_done = int(100 * downloaded / total_size)
+    downloaded_mb = downloaded / 1024 / 1024
+    total_mb = total_size / 1024 / 1024
+    elapsed = max(time.time() - start_time, 0.001)
+    speed = downloaded_mb / elapsed
+    print(
+        f"\r[{'#' * done}{' ' * (50 - done)}] {percent_done}% "
+        f"({downloaded_mb:.2f}Mb/{total_mb:.2f}Mb) {speed:.2f}Mb/s",
+        end="",
+    )
 
 
-def handleGetPlayUrl(item):
-    res = requests.get(url=item['url'], proxies=proxies)
-    html = res.text
-    soup = BeautifulSoup(html, 'html.parser')
-    video = soup.find('video', attrs={'data-apireq': True}).attrs['data-apireq']
-    if video is None:
-        print(f' {item.title} 未查询到下载地址')
-        return False
-    return unquote(video)
+def join_cookies(cookie_headers):
+    cookies = []
+    for cookie in cookie_headers:
+        cookies.append(cookie.split(";", 1)[0])
+    return "; ".join(cookies)
 
 
-def handleGetDownloadUrl(item):
-    print(f'获取 {item["title"]} 真实下载地址')
-    video = handleGetPlayUrl(item)
-    if not video:
-        return video
-    getDownloadUrl(video, item['title'])
-    return True
+def build_request(url, data=None, headers=None):
+    request_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        request_headers.update(headers)
+    return Request(url, data=data, headers=request_headers)
 
 
-def getDownloadUrl(params, title):
-    api = 'https://v.anime1.me/api'
-    res = requests.post(api, data={'d': params}, proxies=proxies)
-    headers = res.headers
-    temp = res.json()['s'][0]['src']
-    cookie = headers['Set-Cookie']
-    handleDownload(f'https:{temp}', title, cookie)
+def open_url(request):
+    opener = build_opener_with_proxy()
+    return opener.open(request)
 
 
-def handleDownload(src, title, cookie):
-    if not os.path.exists('video'):
-        os.mkdir('video')
-    print('下载中...')
-    temp = re.sub(r'\[\d+\]', '', title).strip()
-    path = f'video/{temp}'
-    if not os.path.exists(path):
-        os.mkdir(path)
-    resp = requests.get(url=src, stream=True, headers={
-        "cookie": cookie,
-        "referer": "https://v.anime1.me/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/95.0.4638.69 Safari/537.36"
-    }, proxies=proxies)
+def build_opener_with_proxy():
+    proxies = {}
+    http_proxy = os.environ.get("FAN_DOWNLOAD_HTTP_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    https_proxy = os.environ.get("FAN_DOWNLOAD_HTTPS_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
-    total_length = resp.headers.get('content-length')
-    file_path = f'{path}/{temp}.mp4'
+    if http_proxy:
+        proxies["http"] = http_proxy
+    if https_proxy:
+        proxies["https"] = https_proxy
 
-    if total_length is None:  # 没有内容长度信息，无法显示进度
-        with open(file_path, 'wb') as f:
-            f.write(resp.content)
-    else:
-        # 初始化下载进度和文件总大小
-        dl = 0
-        total_length = int(total_length)
-        start = time.time()  # 开始下载的时间
-        with open(file_path, 'wb') as f:
-            for data in resp.iter_content(chunk_size=4096):
-                now = time.time()  # 当前时间
-                dl += len(data)
-                f.write(data)
-                done = int(50 * dl / total_length)
-                percent_done = int(100 * dl / total_length)
-                downloaded = dl / 1024 / 1024
-                total = total_length / 1024 / 1024
-                speed = downloaded / (now - start)
-                print(
-                    f"\r[{'#' * done}{' ' * (50 - done)}] {percent_done}% ({downloaded:.2f}Mb/{total:.2f}Mb) {speed:.2f}Mb/s",
-                    end='')
-    print(f'{title} 下载完成')
+    if proxies:
+        return build_opener(ProxyHandler(proxies))
+    return build_opener()
 
 
-proxies = {'http': 'http://127.0.0.1:11223', 'https': 'http://127.0.0.1:11223'}
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
