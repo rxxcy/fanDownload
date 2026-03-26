@@ -16,7 +16,7 @@ class OutputPathTests(unittest.TestCase):
                 os.chdir(original_cwd)
 
         normalized = path.replace('\\', '/')
-        self.assertTrue(normalized.endswith("video/異世界的處置依社畜而定-02/異世界的處置依社畜而定-02.mp4"))
+        self.assertTrue(normalized.endswith("video/異世界的處置依社畜而定/異世界的處置依社畜而定-02.mp4"))
 
 
 if __name__ == "__main__":

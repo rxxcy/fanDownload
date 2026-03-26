@@ -339,19 +339,27 @@ def split_episode_suffix(title):
     return base_title, episode
 
 
-def sanitize_title(title):
+def sanitize_component(title):
+    return re.sub(r'[\/:*?"<>|]', "_", title).strip()
+
+
+def build_output_names(title):
     base_title, episode = split_episode_suffix(title)
-    cleaned = re.sub(r'[\\/:*?"<>|]', "_", base_title).strip()
-    if episode and cleaned:
-        return f"{cleaned}-{episode}"
-    return cleaned
+    base_name = sanitize_component(base_title) or sanitize_component(title)
+    file_name = f"{base_name}-{episode}" if episode else base_name
+    return base_name, file_name
+
+
+def sanitize_title(title):
+    _, file_name = build_output_names(title)
+    return file_name
 
 
 def create_output_path(title):
-    safe_title = sanitize_title(title)
-    file_dir = os.path.join("video", safe_title)
+    directory_name, file_name = build_output_names(title)
+    file_dir = os.path.join("video", directory_name)
     os.makedirs(file_dir, exist_ok=True)
-    return os.path.join(file_dir, f"{safe_title}.mp4")
+    return os.path.join(file_dir, f"{file_name}.mp4")
 
 
 def show_progress(downloaded, total_size, start_time, printer=print):
