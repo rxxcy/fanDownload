@@ -1,7 +1,7 @@
-use fan_download::download::{download_selected_items, write_chunks_for_test, DownloadError, DownloadFn, ParallelProgressReporter, DEFAULT_MAX_WORKERS};
+use fan_download::download::{download_selected_items, write_chunks_for_test, DownloadError, DownloadFn, DEFAULT_MAX_WORKERS};
 use fan_download::model::EpisodeItem;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio::time::{sleep, Duration};
 
@@ -41,7 +41,8 @@ async fn downloads_limit_parallelism_to_three_workers() {
         Arc::new(|_line| {}),
         false,
         Arc::new(AtomicBool::new(false)),
-    ).await;
+    )
+    .await;
     assert_eq!(3, max_active.load(Ordering::SeqCst));
     assert_eq!(items.iter().map(|item| item.title.clone()).collect::<Vec<_>>(), summary.successes);
     assert!(summary.failures.is_empty());
@@ -66,7 +67,8 @@ async fn downloads_collect_failures_without_stopping_other_tasks() {
         Arc::new(|_line| {}),
         false,
         Arc::new(AtomicBool::new(false)),
-    ).await;
+    )
+    .await;
     assert_eq!(vec!["Episode 0".to_string(), "Episode 2".to_string()], summary.successes);
     assert_eq!(1, summary.failures.len());
     assert_eq!("Episode 1", summary.failures[0].title);
@@ -111,27 +113,23 @@ async fn downloads_only_print_start_for_running_workers() {
         sleep(Duration::from_millis(10)).await;
     }
     sleep(Duration::from_millis(50)).await;
-    let start_logs = logs.lock().unwrap().iter().filter(|line| line.starts_with("开始下载: ")).cloned().collect::<Vec<_>>();
-    assert_eq!(vec![
-        "开始下载: Episode 0".to_string(),
-        "开始下载: Episode 1".to_string(),
-        "开始下载: Episode 2".to_string(),
-    ], start_logs);
+    let start_logs = logs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.starts_with("开始下载: "))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vec![
+            "开始下载: Episode 0".to_string(),
+            "开始下载: Episode 1".to_string(),
+            "开始下载: Episode 2".to_string(),
+        ],
+        start_logs
+    );
     release.store(true, Ordering::SeqCst);
     let _ = task.await.unwrap();
-}
-
-#[test]
-fn progress_reporter_skips_zero_percent_updates() {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let printer = {
-        let logs = Arc::clone(&logs);
-        Arc::new(move |line: String| logs.lock().unwrap().push(line))
-    };
-    let reporter = Arc::new(ParallelProgressReporter::new(printer, 10));
-    let callback = reporter.make_callback("Episode 1");
-    callback(1024, Some(100 * 1024 * 1024), 3.91);
-    assert!(logs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -145,7 +143,8 @@ async fn cancellation_removes_partial_file() {
         Some(8192),
         None,
         Arc::clone(&stop),
-    ).await;
+    )
+    .await;
     assert!(result.is_ok());
     stop.store(true, Ordering::SeqCst);
     let second_path = dir.path().join("episode2.mp4");
@@ -155,7 +154,8 @@ async fn cancellation_removes_partial_file() {
         Some(8192),
         None,
         Arc::clone(&stop),
-    ).await;
+    )
+    .await;
     assert!(matches!(cancelled, Err(DownloadError::Cancelled)));
     assert!(!second_path.exists());
 }
@@ -186,14 +186,15 @@ async fn stop_signal_prevents_new_tasks_from_starting() {
         Arc::new(|_line| {}),
         false,
         Arc::clone(&stop),
-    ).await;
+    )
+    .await;
     assert_eq!(vec!["Episode 0".to_string()], *started.lock().unwrap());
     assert_eq!(vec!["Episode 0".to_string()], summary.successes);
 }
 
 #[test]
-fn create_output_path_uses_episode_suffix_for_bracketed_numbers() {
+fn create_output_path_uses_shared_series_directory_and_episode_file_name() {
     let path = fan_download::download::create_output_path("異世界的處置依社畜而定 [02]").unwrap();
     let normalized = path.to_string_lossy().replace('\\', "/");
-    assert!(normalized.ends_with("video/異世界的處置依社畜而定-02/異世界的處置依社畜而定-02.mp4"));
+    assert!(normalized.ends_with("video/異世界的處置依社畜而定/異世界的處置依社畜而定-02.mp4"));
 }

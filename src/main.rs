@@ -1,4 +1,4 @@
-use fan_download::anime::{build_client, fetch_page, parse_video_items, resolve_download_url};
+use fan_download::anime::{build_client, fetch_category_items, resolve_download_url};
 use fan_download::download::{download_selected_items, download_video, DownloadError, DownloadFn, Printer, ProgressCallback, StopFlag, DEFAULT_MAX_WORKERS};
 use fan_download::model::EpisodeItem;
 use fan_download::selection::{parse_selection_input, render_episode_list};
@@ -64,15 +64,14 @@ async fn main() {
         }
     };
 
-    let html = match fetch_page(&client, &page_url).await {
-        Ok(html) => html,
+    let items = match fetch_category_items(&client, &page_url).await {
+        Ok(items) => items,
         Err(error) => {
             eprintln!("获取页面失败: {}", error);
             return;
         }
     };
 
-    let items = parse_video_items(&html);
     if items.is_empty() {
         println!("页面内未找到可下载视频");
         return;
