@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from html.parser import HTMLParser
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 
@@ -21,6 +21,7 @@ USER_AGENT = (
     "Chrome/95.0.4638.69 Safari/537.36"
 )
 DEFAULT_MAX_WORKERS = 3
+MAX_CATEGORY_PAGES = 20
 
 
 class DownloadCancelledError(Exception):
@@ -101,8 +102,7 @@ def main():
     while not page_url:
         page_url = input("请输入页面链接：").strip()
 
-    html = fetch_page(page_url)
-    items = parse_video_items(html)
+    items = fetch_category_items(page_url)
     if not items:
         print("页面内未找到可下载视频")
         return
@@ -136,6 +136,74 @@ def parse_video_items(html):
     parser.feed(html)
     parser.close()
     return list(reversed(parser.items))
+
+
+def parse_next_page_url(current_url, html):
+    current = normalize_url(current_url)
+    current_root = category_root(current)
+    if current_root is None:
+        return None
+
+    match = re.search(r'<div class="nav-previous">\s*<a href="([^"]+)"', html)
+    if not match:
+        return None
+
+    next_url = normalize_url(urljoin(current, match.group(1)))
+    if category_root(next_url) != current_root:
+        return None
+    return next_url
+
+
+def category_root(url):
+    parts = urlsplit(url)
+    segments = [segment for segment in parts.path.split('/') if segment]
+    if len(segments) >= 2 and segments[-2] == 'page' and segments[-1].isdigit():
+        segments = segments[:-2]
+    if not segments:
+        return None
+    return '/' + '/'.join(segments)
+
+
+def episode_number(title):
+    match = re.search(r'\[(\d+)\]\s*$', title.strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def collect_video_items_from_pages(html_pages):
+    merged = []
+    seen = set()
+    for html in html_pages:
+        for item in parse_video_items(html):
+            key = (item['title'], item['api_req'])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+
+    indexed_items = list(enumerate(merged))
+    indexed_items.sort(key=lambda pair: (episode_number(pair[1]['title']) is None, episode_number(pair[1]['title']) or 10**9, pair[0]))
+    return [item for _, item in indexed_items]
+
+
+def fetch_category_items(page_url):
+    visited = set()
+    current_url = normalize_url(page_url)
+    html_pages = []
+
+    for _ in range(MAX_CATEGORY_PAGES):
+        if current_url in visited:
+            break
+        visited.add(current_url)
+        html = fetch_page(current_url)
+        html_pages.append(html)
+        next_url = parse_next_page_url(current_url, html)
+        if not next_url or next_url in visited:
+            break
+        current_url = next_url
+
+    return collect_video_items_from_pages(html_pages)
 
 
 def select_video(items, input_fn=input):
